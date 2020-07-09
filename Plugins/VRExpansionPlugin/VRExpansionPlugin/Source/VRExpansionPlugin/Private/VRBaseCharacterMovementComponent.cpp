@@ -789,6 +789,9 @@ void UVRBaseCharacterMovementComponent::PhysCustom(float deltaTime, int32 Iterat
 		break;
 	case EVRCustomMovementMode::VRMOVE_Seated:
 		break;
+	case EVRCustomMovementMode::VRMOVE_DynamicGravityWalking:
+		PhysCustom_DynamicGravityWalking(deltaTime, Iterations);
+		break;
 	default:
 		Super::PhysCustom(deltaTime, Iterations);
 		break;
@@ -798,6 +801,109 @@ void UVRBaseCharacterMovementComponent::PhysCustom(float deltaTime, int32 Iterat
 bool UVRBaseCharacterMovementComponent::VRClimbStepUp(const FVector& GravDir, const FVector& Delta, const FHitResult &InHit, FStepDownResult* OutStepDownResult)
 {
 	return StepUp(GravDir, Delta, InHit, OutStepDownResult);
+}
+
+void UVRBaseCharacterMovementComponent::PhysCustom_DynamicGravityWalking(float deltaTime, int32 Iterations)
+{
+	if (deltaTime < MIN_TICK_TIME)
+	{
+		return;
+	}
+
+	FVector CustomGravityDirection = FVector(-1.f, 0.f, 0.f);
+	FVector GravityForce = CustomGravityDirection.GetSafeNormal() * -GetGravityZ();
+
+	FQuat CurrentRot = UpdatedComponent->GetComponentQuat();
+	FQuat DeltaRot = FQuat::FindBetweenNormals(CustomGravityDirection, CurrentRot.GetUpVector());
+
+	//UpdatedComponent->SetWorldRotation(CustomGravityDirection.Rotation().Quaternion());//(CurrentRot * DeltaRot);
+
+	// Rewind the players position by the new capsule location
+	RewindVRRelativeMovement();
+
+	RestorePreAdditiveRootMotionVelocity();
+	//RestorePreAdditiveVRMotionVelocity();
+
+	FVector OrigVelocity = Velocity;
+
+	if (!HasAnimRootMotion() && !CurrentRootMotion.HasOverrideVelocity())
+	{
+		if (bCheatFlying && Acceleration.IsZero())
+		{
+			Velocity = FVector::ZeroVector;
+		}
+		const float Friction = 0.5f * GetPhysicsVolume()->FluidFriction;
+
+		CalcVelocity(deltaTime, Friction, true, 0.f);
+		//FVector FallVelocity = Velocity.ProjectOnToNormal(-CustomGravityDirection.GetSafeNormal());
+	}
+
+	// Apply custom gravity
+	//Velocity += GravityForce * deltaTime;
+
+	Velocity = NewFallVelocity(Velocity, GravityForce, deltaTime);
+	//Velocity += OrigVelocity;
+
+	ApplyRootMotionToVelocity(deltaTime);
+	//ApplyVRMotionToVelocity(deltaTime);
+
+	// Manually handle the velocity setup
+	// #TODO: Rotate this by the directional difference
+	LastPreAdditiveVRVelocity = (AdditionalVRInputVector) / deltaTime;
+	bool bExtremeInput = false;
+	if (LastPreAdditiveVRVelocity.SizeSquared() > FMath::Square(TrackingLossThreshold))
+	{
+		// Default to always holding position during flight to avoid too much velocity injection
+		AdditionalVRInputVector = FVector::ZeroVector;
+		LastPreAdditiveVRVelocity = FVector::ZeroVector;
+	}
+
+	Iterations++;
+	bJustTeleported = false;
+
+	FVector OldLocation = UpdatedComponent->GetComponentLocation();
+	const FVector Adjusted = Velocity * deltaTime;
+	FHitResult Hit(1.f);
+	SafeMoveUpdatedComponent(Adjusted + AdditionalVRInputVector, UpdatedComponent->GetComponentQuat(), true, Hit);
+
+	if (Hit.Time < 1.f)
+	{
+		const FVector GravDir = CustomGravityDirection;
+		const FVector VelDir = Velocity.GetSafeNormal();
+		const float UpDown = GravDir | VelDir;
+
+		bool bSteppedUp = false;
+		if ((FMath::Abs(Hit.ImpactNormal.Z) < 0.2f) && (UpDown < 0.5f) && (UpDown > -0.2f) && CanStepUp(Hit))
+		{
+			float stepZ = UpdatedComponent->GetComponentLocation().Z;
+			// #TODO: Need a custom step up function
+			//bSteppedUp = StepUp(GravDir, (Adjusted + AdditionalVRInputVector) * (1.f - Hit.Time) /*+ AdditionalVRInputVector.GetSafeNormal2D()*/, Hit, nullptr);
+			if (bSteppedUp)
+			{
+				OldLocation.Z = UpdatedComponent->GetComponentLocation().Z + (OldLocation.Z - stepZ);
+			}
+		}
+
+		if (!bSteppedUp)
+		{
+			//adjust and try again
+			// #TODO: Need a custom Handle Impact
+			//HandleImpact(Hit, deltaTime, Adjusted);
+			// #TODO: Need a custom SlideAlongSurface
+			//SlideAlongSurface(Adjusted, (1.f - Hit.Time), Hit.Normal, Hit, true);
+		}
+	}
+
+	if (!bJustTeleported)
+	{
+		if (!HasAnimRootMotion() && !CurrentRootMotion.HasOverrideVelocity())
+		{
+			//Velocity = ((UpdatedComponent->GetComponentLocation() - OldLocation) - AdditionalVRInputVector) / deltaTime;
+			Velocity = ((UpdatedComponent->GetComponentLocation() - OldLocation)) / deltaTime;
+		}
+
+		RestorePreAdditiveVRMotionVelocity();
+	}
 }
 
 void UVRBaseCharacterMovementComponent::PhysCustom_Climbing(float deltaTime, int32 Iterations)
@@ -816,7 +922,6 @@ void UVRBaseCharacterMovementComponent::PhysCustom_Climbing(float deltaTime, int
 			characterOwner->UpdateClimbingMovement(deltaTime);
 		}
 	}
-
 
 	// I am forcing this to 0 to avoid some legacy velocity coming out of other movement modes, climbing should only be direct movement anyway.
 	Velocity = FVector::ZeroVector;
@@ -1085,114 +1190,6 @@ void UVRBaseCharacterMovementComponent::ApplyNetworkMovementMode(const uint8 Rec
 	
 	Super::ApplyNetworkMovementMode(ReceivedMode);
 }
-
-/*void UVRBaseCharacterMovementComponent::SendClientAdjustment()
-{
-	if (!HasValidData())
-	{
-		return;
-	}
-
-	FNetworkPredictionData_Server_Character* ServerData = GetPredictionData_Server_Character();
-	check(ServerData);
-
-	if (ServerData->PendingAdjustment.TimeStamp <= 0.f)
-	{
-		return;
-	}
-
-	if (ServerData->PendingAdjustment.bAckGoodMove == true)
-	{
-		// just notify client this move was received
-		ClientAckGoodMove(ServerData->PendingAdjustment.TimeStamp);
-	}
-	else
-	{
-		const bool bIsPlayingNetworkedRootMotionMontage = CharacterOwner->IsPlayingNetworkedRootMotionMontage();
-		if (HasRootMotionSources())
-		{
-			FRotator Rotation = ServerData->PendingAdjustment.NewRot.GetNormalized();
-			FVector_NetQuantizeNormal CompressedRotation(Rotation.Pitch / 180.f, Rotation.Yaw / 180.f, Rotation.Roll / 180.f);
-			ClientAdjustRootMotionSourcePosition
-			(
-				ServerData->PendingAdjustment.TimeStamp,
-				CurrentRootMotion,
-				bIsPlayingNetworkedRootMotionMontage,
-				bIsPlayingNetworkedRootMotionMontage ? CharacterOwner->GetRootMotionAnimMontageInstance()->GetPosition() : -1.f,
-				ServerData->PendingAdjustment.NewLoc,
-				CompressedRotation,
-				ServerData->PendingAdjustment.NewVel.Z,
-				ServerData->PendingAdjustment.NewBase,
-				ServerData->PendingAdjustment.NewBaseBoneName,
-				ServerData->PendingAdjustment.NewBase != NULL,
-				ServerData->PendingAdjustment.bBaseRelativePosition,
-				PackNetworkMovementMode()
-			);
-		}
-		else if (bIsPlayingNetworkedRootMotionMontage)
-		{
-			FRotator Rotation = ServerData->PendingAdjustment.NewRot.GetNormalized();
-			FVector_NetQuantizeNormal CompressedRotation(Rotation.Pitch / 180.f, Rotation.Yaw / 180.f, Rotation.Roll / 180.f);
-			ClientAdjustRootMotionPosition
-			(
-				ServerData->PendingAdjustment.TimeStamp,
-				CharacterOwner->GetRootMotionAnimMontageInstance()->GetPosition(),
-				ServerData->PendingAdjustment.NewLoc,
-				CompressedRotation,
-				ServerData->PendingAdjustment.NewVel.Z,
-				ServerData->PendingAdjustment.NewBase,
-				ServerData->PendingAdjustment.NewBaseBoneName,
-				ServerData->PendingAdjustment.NewBase != NULL,
-				ServerData->PendingAdjustment.bBaseRelativePosition,
-				PackNetworkMovementMode()
-			);
-		}
-		else if (ServerData->PendingAdjustment.NewVel.IsZero())
-		{
-			if (AVRBaseCharacter * VRC = Cast<AVRBaseCharacter>(GetOwner()))
-			{
-				FVector CusVec = VRC->GetVRLocation_Inline();
-				GEngine->AddOnScreenDebugMessage(-1, 125.f, IsLocallyControlled() ? FColor::Red : FColor::Green, FString::Printf(TEXT("VrLoc: x: %f, y: %f, X: %f"), CusVec.X, CusVec.Y, CusVec.Z));
-			}
-			GEngine->AddOnScreenDebugMessage(-1, 125.f, FColor::Red, TEXT("Correcting Client Location!"));
-			ClientVeryShortAdjustPosition
-			(
-				ServerData->PendingAdjustment.TimeStamp,
-				ServerData->PendingAdjustment.NewLoc,
-				ServerData->PendingAdjustment.NewBase,
-				ServerData->PendingAdjustment.NewBaseBoneName,
-				ServerData->PendingAdjustment.NewBase != NULL,
-				ServerData->PendingAdjustment.bBaseRelativePosition,
-				PackNetworkMovementMode()
-			);
-		}
-		else
-		{
-			if (AVRBaseCharacter * VRC = Cast<AVRBaseCharacter>(GetOwner()))
-			{
-				FVector CusVec = VRC->GetVRLocation_Inline();
-				GEngine->AddOnScreenDebugMessage(-1, 125.f, IsLocallyControlled() ? FColor::Red : FColor::Green, FString::Printf(TEXT("VrLoc: x: %f, y: %f, X: %f"), CusVec.X, CusVec.Y, CusVec.Z));
-			}
-			GEngine->AddOnScreenDebugMessage(-1, 125.f, FColor::Red, TEXT("Correcting Client Location!"));
-			ClientAdjustPosition
-			(
-				ServerData->PendingAdjustment.TimeStamp,
-				ServerData->PendingAdjustment.NewLoc,
-				ServerData->PendingAdjustment.NewVel,
-				ServerData->PendingAdjustment.NewBase,
-				ServerData->PendingAdjustment.NewBaseBoneName,
-				ServerData->PendingAdjustment.NewBase != NULL,
-				ServerData->PendingAdjustment.bBaseRelativePosition,
-				PackNetworkMovementMode()
-			);
-		}
-	}
-
-	ServerData->PendingAdjustment.TimeStamp = 0;
-	ServerData->PendingAdjustment.bAckGoodMove = false;
-	ServerData->bForceClientUpdate = false;
-}
-*/
 
 void  UVRBaseCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewUpdatedComponent)
 {
